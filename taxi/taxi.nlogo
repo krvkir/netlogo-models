@@ -17,7 +17,9 @@ riders-own [
 
 orders-own [
   assigned?
+  started?
   lifetime
+  cost
 ]
 
 directed-link-breed [rider-order-links rider-order-link]
@@ -28,9 +30,15 @@ globals [
   ; Counters
   new-order-cnt
   expired-order-cnt
+  income
+  burned-income
+  ; Aggregates
   total-time-on-trip
   total-time-to-rider
   total-time-idle
+  total-new-order-cnt
+  total-expired-order-cnt
+  total-income ;; aka GMV
   ; Metrics
   burn-rate
 ]
@@ -41,6 +49,8 @@ to init-driver [a-driver]
   set occupied? false
   set with-rider? false
   reset-driver-counters self
+  set color yellow
+  set size 1.4
 end
 
 to reset-driver-counters [a-driver]
@@ -53,7 +63,11 @@ to init-rider [a-rider]
   set xcor (random-float 2 - 1) * max-pxcor
   set ycor (random-float 2 - 1) * max-pycor
   set has-order? false
+  set color white
 end
+
+
+;; Setup
 
 to setup
   ; Clear globals, ticks, turtles, patches, drawing, plots, output.
@@ -74,21 +88,19 @@ to setup
   reset-ticks
 end
 
+
+;; Go
+
 to go
   ; Riders ask for a ride (put orders).
   ask riders with [not has-order?] [
-    ifelse random-float 1 < order-proba / 60 [
+    if random-float 1 < order-proba / 60 [
       ask-for-ride self
-    ][
-      if riders-stroll? [
-        right random 30 - 15
-        forward driver-speed / 20
-      ]
     ]
   ]
   ; The system looks for drivers and assigns them to orders.
   ask orders with [not assigned?] [
-    find-driver-or-expire self
+    try-find-driver self
   ]
   ; Drivers with orders who didn't take riders move to their riders.
   ask drivers with [occupied? and not with-rider?] [ move-towards-rider self ]
@@ -102,15 +114,121 @@ to go
     ]
     set time-idle time-idle + 1
   ]
+  ; Orders where the trip didn't start yet are expiring.
+  ask orders [ update-order self ]
+  ; Riders with expired orders cancel them.
+  ask riders [ update-rider self ]
+
   if ticks mod (60 * metrics-collect-period) = 0 [ collect-metrics ]
   tick
 end
+
+
+;; Order stuff
+
+to ask-for-ride [a-rider]
+  hatch-orders 1 [
+    create-rider-order-link-from a-rider
+    set assigned? false
+    set started? false
+    set color red
+    ; Set the destination location.
+    set xcor (random-float 2 - 1) * max-pxcor
+    set ycor (random-float 2 - 1) * max-pycor
+    ; Set the lifetime: how many ticks a rider will wait for a driver.
+    set lifetime max (list 1 (random-normal rider-patience-on-lookup 1))
+    ; Calculate the cost.
+    calculate-cost self
+  ]
+  set has-order? true
+  set new-order-cnt new-order-cnt + 1
+end
+
+to calculate-cost [an-order]
+  let a-rider one-of in-rider-order-link-neighbors
+  set cost distance a-rider
+end
+
+to try-find-driver [an-order]
+  let a-rider one-of in-rider-order-link-neighbors
+  ask a-rider [
+    let driver-candidates drivers with [not occupied?] in-radius driver-search-radius
+    if count driver-candidates > 0 [
+      ; If we found the driver, assign him to the order.
+      let a-driver (ifelse-value
+        assign-drivers = "randomly" [
+          one-of driver-candidates
+        ]
+        assign-drivers = "closest" [
+          one-of driver-candidates with [distance a-rider = min [distance a-rider] of driver-candidates]
+        ]
+        [
+          one-of driver-candidates
+        ]
+        )
+      ask a-driver [
+        create-driver-order-link-to an-order
+        create-driver-rider-link-to a-rider
+        set occupied? true
+        set color green
+      ]
+      ask an-order [
+        set assigned? true
+        set color yellow
+        set lifetime max (list 1 (random-normal rider-patience-on-wait 1))
+      ]
+    ]
+  ]
+end
+
+to update-order [an-order]
+  ; If we didn't find the driver, see if the rider is ready to wait.
+  ifelse not assigned? [
+    set lifetime lifetime - 1
+  ][
+    if not started? [
+      set lifetime lifetime - 0.5
+    ]
+  ]
+end
+
+to cancel-order [a-rider]
+  let an-order one-of out-rider-order-link-neighbors
+  ask [in-driver-order-link-neighbors] of an-order [
+    set with-rider? false
+    set occupied? false
+    set color yellow
+  ]
+  ask my-in-driver-rider-links [ die ]
+  set has-order? false
+  set color red
+  set expired-order-cnt expired-order-cnt + 1
+  ask an-order [
+    set burned-income burned-income + cost
+    die
+  ]
+end
+
+to update-rider [a-rider]
+  if has-order? [
+    let an-order one-of out-rider-order-link-neighbors
+    if [lifetime] of an-order <= 0 [
+      cancel-order self
+    ]
+  ]
+  if not has-order? and riders-stroll? [
+    right random 30 - 15
+    forward driver-speed / 20
+  ]
+end
+
+;; Driver stuff
 
 to move-towards-rider [a-driver]
   let link-to-rider one-of my-out-driver-rider-links
   ; If we reached the rider, let him in.
   ifelse [link-length] of link-to-rider < 0.1 [
-    set with-rider? true
+    pickup-rider self
   ]
   ; Otherwise go towards the rider.
   [
@@ -120,15 +238,22 @@ to move-towards-rider [a-driver]
   set time-to-rider time-to-rider + 1
 end
 
+to pickup-rider [a-driver]
+  set with-rider? true
+  ask one-of out-driver-order-link-neighbors [
+    set started? true
+    set color green
+  ]
+  ask out-driver-rider-link-neighbors [
+    set color green
+  ]
+end
+
 to move-to-destination [a-driver]
   let link-to-destination one-of my-out-driver-order-links
   ; If we reached the destination, let the rider out and finish the order.
   ifelse [link-length] of link-to-destination < 0.1 [
-    set with-rider? false
-    set occupied? false
-    ask out-driver-order-link-neighbors [ die ]
-    ask out-driver-rider-link-neighbors [ set has-order? false ]
-    ask my-out-driver-rider-links [die]
+    close-order self
   ]
   ; Otherwise, go towards the destination.
   [
@@ -143,47 +268,25 @@ to move-to-destination [a-driver]
   set time-on-trip time-on-trip + 1
 end
 
-to ask-for-ride [a-rider]
-  hatch-orders 1 [
-    create-rider-order-link-from a-rider
-    ; Set the destination location.
-    set xcor (random-float 2 - 1) * max-pxcor
-    set ycor (random-float 2 - 1) * max-pycor
-    ; Set the lifetime: how many ticks a rider will wait for a driver.
-    set lifetime random 5
-    set assigned? false
+to close-order [a-driver]
+  set with-rider? false
+  set occupied? false
+  ask out-driver-order-link-neighbors [
+    set income income + cost
+    die
   ]
-  set new-order-cnt new-order-cnt + 1
+  ask out-driver-rider-link-neighbors [ set has-order? false ]
+  ask my-out-driver-rider-links [die]
+  set color yellow
 end
 
-to find-driver-or-expire [an-order]
-  let a-rider one-of in-rider-order-link-neighbors
-  ask a-rider [
-    let driver-candidates drivers with [not occupied?] in-radius driver-search-radius
-    if count driver-candidates > 0 [
-      ; If we found the driver, assign him to the order.
-      ask one-of driver-candidates [
-        create-driver-order-link-to an-order
-        create-driver-rider-link-to a-rider
-        set occupied? true
-      ]
-      ask an-order [
-        set assigned? true
-      ]
-    ]
-  ]
-  if not assigned? [
-    ; If we didn't find the driver, see if the rider is ready to wait.
-    set lifetime lifetime - 1
-    if lifetime <= 0 [
-      set expired-order-cnt expired-order-cnt + 1
-      die
-    ]
-  ]
-end
+
+;; Metrics stuff
 
 to collect-metrics
   ; Save raw metrics to global vars.
+  set total-new-order-cnt new-order-cnt
+  set total-expired-order-cnt expired-order-cnt
   ifelse new-order-cnt = 0 [
     set burn-rate 0
   ][
@@ -192,17 +295,22 @@ to collect-metrics
   set total-time-on-trip sum [time-on-trip] of drivers
   set total-time-to-rider sum [time-to-rider] of drivers
   set total-time-idle sum [time-idle] of drivers
+  set total-income income
 
   reset-counters
 end
 
 to reset-counters
+  set income 0
   set expired-order-cnt 0
   set new-order-cnt 0
   ask drivers [
     reset-driver-counters self
   ]
 end
+
+
+;; Controls
 
 to add-10-drivers
   create-drivers 10 [
@@ -244,13 +352,13 @@ ticks
 SLIDER
 15
 15
-187
+185
 48
 #-drivers
 #-drivers
 0
 100
-11.0
+10.0
 1
 1
 NIL
@@ -259,7 +367,7 @@ HORIZONTAL
 SLIDER
 15
 55
-187
+185
 88
 #-riders
 #-riders
@@ -288,33 +396,16 @@ NIL
 NIL
 1
 
-BUTTON
-210
-505
-273
-538
-NIL
-go
-T
-1
-T
-OBSERVER
-NIL
-NIL
-NIL
-NIL
-1
-
 SLIDER
 15
-95
-187
-128
+125
+185
+158
 driver-search-radius
 driver-search-radius
 0
 100
-7.0
+10.0
 1
 1
 NIL
@@ -322,9 +413,9 @@ HORIZONTAL
 
 SLIDER
 15
-140
-187
-173
+255
+185
+288
 driver-speed
 driver-speed
 0
@@ -337,14 +428,14 @@ HORIZONTAL
 
 SLIDER
 15
+370
 185
-185
-218
+403
 order-proba
 order-proba
 0.01
 1
-0.07
+0.05
 0.01
 1
 NIL
@@ -384,10 +475,10 @@ ticks mod 60
 11
 
 PLOT
-655
-15
-855
-165
+865
+390
+1065
+510
 Occupied drivers %
 NIL
 NIL
@@ -403,20 +494,20 @@ PENS
 
 SWITCH
 15
-230
+295
 185
-263
+328
 drivers-stroll?
 drivers-stroll?
-0
+1
 1
 -1000
 
 SWITCH
 15
-275
+490
 185
-308
+523
 riders-stroll?
 riders-stroll?
 1
@@ -442,15 +533,15 @@ PENS
 "default" 1.0 0 -16777216 true "" "plot burn-rate"
 
 SLIDER
-15
-320
-185
-353
+295
+515
+480
+548
 metrics-collect-period
 metrics-collect-period
 1
 24
-24.0
+12.0
 1
 1
 hrs
@@ -469,11 +560,11 @@ NIL
 0.0
 1.0
 true
-false
+true
 "" ""
 PENS
-"trip + path to rider" 1.0 0 -16777216 true "" "plot (total-time-on-trip + total-time-to-rider)\n/ (total-time-on-trip + total-time-to-rider + total-time-idle)"
-"trip only" 1.0 0 -7500403 true "" "plot total-time-on-trip\n/ (total-time-on-trip + total-time-to-rider + total-time-idle)"
+"trip+" 1.0 0 -16777216 true "" "plot (total-time-on-trip + total-time-to-rider)\n/ (total-time-on-trip + total-time-to-rider + total-time-idle)"
+"trip" 1.0 0 -7500403 true "" "plot total-time-on-trip\n/ (total-time-on-trip + total-time-to-rider + total-time-idle)"
 
 BUTTON
 495
@@ -507,6 +598,185 @@ NIL
 NIL
 NIL
 NIL
+1
+
+CHOOSER
+15
+165
+185
+210
+assign-drivers
+assign-drivers
+"randomly" "closest"
+1
+
+PLOT
+865
+15
+1065
+135
+Drivers #
+NIL
+NIL
+0.0
+10.0
+0.0
+10.0
+true
+false
+"" ""
+PENS
+"default" 1.0 0 -16777216 true "" "plot count drivers"
+
+PLOT
+865
+140
+1065
+260
+Driver search radius
+NIL
+NIL
+0.0
+10.0
+0.0
+10.0
+true
+false
+"" ""
+PENS
+"default" 1.0 0 -16777216 true "" "plot driver-search-radius"
+
+PLOT
+865
+265
+1065
+385
+Order probabilty
+NIL
+NIL
+0.0
+10.0
+0.0
+1.0
+true
+false
+"" ""
+PENS
+"default" 1.0 0 -16777216 true "" "plot order-proba"
+
+PLOT
+655
+495
+855
+645
+Driver time spent
+NIL
+NIL
+0.0
+10.0
+0.0
+10.0
+true
+true
+"" ""
+PENS
+"total" 1.0 0 -16777216 true "" "plot (total-time-on-trip + total-time-to-rider + total-time-idle)"
+"on-trip" 1.0 0 -10899396 true "" "plot total-time-on-trip"
+"idle" 1.0 0 -2674135 true "" "plot total-time-idle"
+
+PLOT
+655
+15
+855
+165
+Income
+NIL
+NIL
+0.0
+10.0
+0.0
+10.0
+true
+false
+"" ""
+PENS
+"default" 1.0 0 -16777216 true "" "plot total-income"
+
+SLIDER
+15
+410
+185
+443
+rider-patience-on-lookup
+rider-patience-on-lookup
+1
+10
+2.0
+0.1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+15
+450
+185
+483
+rider-patience-on-wait
+rider-patience-on-wait
+1
+10
+5.2
+0.1
+1
+NIL
+HORIZONTAL
+
+BUTTON
+210
+505
+273
+538
+NIL
+go
+T
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+1
+
+TEXTBOX
+20
+350
+170
+368
+Riders (we don't control them)
+11
+0.0
+1
+
+TEXTBOX
+20
+225
+170
+251
+Drivers (we control them to some extent)
+11
+0.0
+1
+
+TEXTBOX
+20
+105
+170
+123
+System (we control it)
+11
+0.0
 1
 
 @#$#@#$#@
